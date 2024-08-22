@@ -138,6 +138,12 @@ def make_pattern(description_text):
     pattern = r'\s*'.join(escape_word(word) for word in words)
     return pattern
 
+def extract_h2_titles(html_content):
+    soup = BeautifulSoup(html_content, 'html.parser')
+    h2_tags = soup.find_all('h2')
+    titles = [tag.get_text() for tag in h2_tags]
+    return titles
+
 def main():
     st.title("HTML Content Processor")
     
@@ -186,14 +192,12 @@ def main():
                 attach_first_selected_image(driver)
                 search_and_select_article(driver, article_name)
                 image_htmls = process_images(driver, num_images_to_process)
-
-                result_text, _ = replace_text_with_html(html_content, image_htmls)
-                result_text = replace_br_with_nbsp(result_text)
-
-                st.write("Final HTML with images:")
-                st.code(result_text)
+                html_content, _ = replace_text_with_html(html_content, image_htmls)
+                
+                st.write("Updated HTML content:")
+                st.code(html_content)
+                
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
             finally:
                 driver.quit()
-                
-if __name__ == "__main__":
-    main()
