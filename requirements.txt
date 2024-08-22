@@ -1,0 +1,7 @@
+streamlit
+beautifulsoup4
+requests
+opencv-python-headless
+numpy
+matplotlib
+selenium
