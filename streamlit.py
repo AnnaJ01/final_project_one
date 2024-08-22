@@ -1,155 +1,199 @@
+import re
 import streamlit as st
 from bs4 import BeautifulSoup
-import re
-import pyperclip
+import pandas as pd
 import os
+import time
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
-import time
+from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException, TimeoutException
 
-# Streamlit application
-st.title("HTML Content Processor and Image Manager")
+# Configure paths
+CHROME_DRIVER_PATH = 'chromedriver'  # Adjust path if necessary
 
-# Input for article name and number of images
-article_name_to_search = st.text_input("Enter the article name to search and attach:")
-num_images_to_process = st.number_input("Enter the number of images to process:", min_value=1, step=1)
+def login_to_wordpress(driver, username, password):
+    driver.get("https://wp.thecollector.com/wp-login.php")
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'user_login'))).send_keys(username)
+    driver.find_element(By.ID, 'user_pass').send_keys(password)
+    driver.find_element(By.ID, 'wp-submit').click()
+    WebDriverWait(driver, 10).until(EC.title_contains("Dashboard"))
 
-# Text area for pasted HTML
-pasted_text = st.text_area("Paste HTML content here:")
+def navigate_to_media_library(driver):
+    driver.get("https://wp.thecollector.com/wp-admin/upload.php?mode=list")
+    time.sleep(5)
+    WebDriverWait(driver, 10).until(EC.title_contains("Media Library"))
 
-def extract_h2_titles(html_content):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    h2_tags = soup.find_all('h2')
-    titles = [tag.get_text(strip=True) for tag in h2_tags]
-    return titles
+def select_images(driver, num_images):
+    checkboxes = driver.find_elements(By.XPATH, '//input[@type="checkbox" and contains(@name, "media[]")]')
+    if len(checkboxes) < num_images:
+        num_images = len(checkboxes)
+    for i in range(num_images):
+        if not checkboxes[i].is_selected():
+            checkboxes[i].click()
 
-if st.button('Process HTML'):
-    # Extract titles
-    titles = extract_h2_titles(pasted_text)
-    st.write("Extracted Titles:", titles)
+def attach_first_selected_image(driver):
+    try:
+        first_attach_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '(//a[contains(@aria-label, "Attach") and contains(@class, "hide-if-no-js")])[1]'))
+        )
+        driver.execute_script("arguments[0].scrollIntoView(true);", first_attach_button)
+        time.sleep(1)
+        first_attach_button.click()
+    except ElementClickInterceptedException as e:
+        st.error(f"ElementClickInterceptedException encountered: {e}")
 
-    # Removing spans
-    pattern_with_content = r'<span style="font-weight: 400;">(.*?)<\/span>'
-    pasted_text = re.sub(pattern_with_content, r'\1', pasted_text, flags=re.DOTALL)
-    pattern_empty = r'<span style="font-weight: 400;"><\/span>'
-    pasted_text = re.sub(pattern_empty, '', pasted_text)
+def search_and_select_article(driver, article_name):
+    try:
+        search_input = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.ID, "find-posts-input")))
+        search_input.send_keys(article_name)
+        search_button = driver.find_element(By.ID, "find-posts-search")
+        search_button.click()
+        time.sleep(2)
+        first_article_radio = WebDriverWait(driver, 10).until(
+            EC.visibility_of_element_located((By.XPATH, '//input[@type="radio" and @name="found_post_id"]'))
+        )
+        first_article_radio.click()
+        select_button = driver.find_element(By.ID, "find-posts-submit")
+        select_button.click()
+    except TimeoutException:
+        st.error(f"Timeout while searching/selecting the article '{article_name}'")
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {e}")
 
-    # Replace &nbsp; with <br>
-    def replace_nbsp_with_br(html):
-        return re.sub(r'&nbsp;', '<br>', html)
+def extract_image_details(driver):
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'poststuff')))
+    permalink = driver.find_element(By.ID, 'sample-permalink').get_attribute('href')
+    attachment_id = permalink.split('attachment_id=')[1]
+    dimensions_text = driver.find_element(By.CSS_SELECTOR, '.misc-pub-dimensions strong').text
+    width, height = dimensions_text.replace('×', 'x').split('x')
+    name = driver.find_element(By.ID, 'title').get_attribute('value')
+    caption = driver.find_element(By.ID, 'attachment_caption').text
+    url = driver.find_element(By.ID, 'attachment_url').get_attribute('value')
+    details = {
+        'id': attachment_id,
+        'width': width.strip(),
+        'height': height.strip(),
+        'name': name,
+        'caption': caption.strip(),
+        'url': url.strip()
+    }
+    return details
 
-    pasted_text = replace_nbsp_with_br(pasted_text)
+def generate_caption(id, width, height, name, caption, url):
+    return (
+        f'[caption id="attachment_{id}" align="aligncenter" width="{width}"]'
+        f'<img class="size-full wp-image-{id}" src="{url}" alt="{name.replace("-", " ")}" width="{width}" height="{height}" /> '
+        f'{caption}[/caption]'
+    )
 
-    # Open anchor tags in new window
-    def add_target_blank_to_anchors(html, base_domain):
-        soup = BeautifulSoup(html, 'html.parser')
-        anchors = soup.find_all('a', href=True)
-        for a in anchors:
-            href = a['href']
-            if not href.startswith(base_domain):
-                a['target'] = '_blank'
-                a['rel'] = 'noopener'
-        return str(soup)
+def process_images(driver, num_images_to_process):
+    image_htmls = []
+    image_details_list = []
+    for i in range(1, num_images_to_process + 1):
+        image = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, f'tbody#the-list tr:nth-child({i}) a'))
+        )
+        image.click()
+        image_details = extract_image_details(driver)
+        image_details_list.append(image_details)
+        driver.back()
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, 'the-list'))
+        )
+    for details in image_details_list:
+        caption_html = generate_caption(details['id'], details['width'], details['height'], details['name'], details['caption'], details['url'])
+        image_htmls.append(caption_html)
+    return image_htmls
 
-    base_domain = 'https://www.thecollector.com/'
-    pasted_text = add_target_blank_to_anchors(pasted_text, base_domain)
+def replace_br_with_nbsp(html):
+    return re.sub(r'<br\s*/?>', '&nbsp;', html, flags=re.IGNORECASE)
 
-    # Ensure <h2> tags are bold
-    def ensure_strong_in_h2(html):
-        soup = BeautifulSoup(html, 'html.parser')
-        h2_tags = soup.find_all('h2')
-        for h2 in h2_tags:
-            if h2.find('b'):
-                for b in h2.find_all('b'):
-                    strong_tag = soup.new_tag('strong')
-                    strong_tag.extend(b.contents)
-                    b.replace_with(strong_tag)
-            if not h2.find('strong'):
-                strong_tag = soup.new_tag('strong')
-                strong_tag.extend(h2.contents)
-                h2.clear()
-                h2.append(strong_tag)
-        return str(soup)
+def replace_text_with_html(text, image_htmls):
+    patterns_used = []
+    images_without_captions = []
+    for image_html in image_htmls:
+        description_match = re.search(r'<img[^>]+> (\w.*?)\[/caption\]', image_html, re.DOTALL)
+        if description_match:
+            description_text = description_match.group(1).strip()
+            pattern = make_pattern(description_text)
+            patterns_used.append(pattern)
+            text = re.sub(pattern, image_html, text, flags=re.IGNORECASE | re.DOTALL)
+        else:
+            no_caption_match = re.search(r'<img[^>]+>', image_html)
+            if no_caption_match:
+                images_without_captions.append(image_html)
+    images_without_captions = list(set(images_without_captions))
+    for img in reversed(images_without_captions):
+        text = img + '\n\n' + text
+    return text, patterns_used
 
-    pasted_text = ensure_strong_in_h2(pasted_text)
+def make_pattern(description_text):
+    words = re.split(r'\s+', description_text)
+    def escape_word(word):
+        return re.escape(word) + r'(\s*<[^>]+>\s*)?'
+    pattern = r'\s*'.join(escape_word(word) for word in words)
+    return pattern
 
-    # Ensure <h3> tags are bold
-    def ensure_strong_in_h3(html):
-        soup = BeautifulSoup(html, 'html.parser')
-        h3_tags = soup.find_all('h3')
-        for h3 in h3_tags:
-            if h3.find('b'):
-                for b in h3.find_all('b'):
-                    strong_tag = soup.new_tag('strong')
-                    strong_tag.extend(b.contents)
-                    b.replace_with(strong_tag)
-            if not h3.find('strong'):
-                strong_tag = soup.new_tag('strong')
-                strong_tag.extend(h3.contents)
-                h3.clear()
-                h3.append(strong_tag)
-        return str(soup)
+def main():
+    st.title("HTML Content Processor")
+    
+    uploaded_file = st.file_uploader("Upload your HTML file", type=["html"])
+    if uploaded_file:
+        html_content = uploaded_file.read().decode("utf-8")
+        st.write("Original HTML content:")
+        st.code(html_content)
+        
+        st.header("Process HTML")
+        article_name = st.text_input("Enter the article name to search and attach:")
+        num_images_to_process = st.number_input("Enter the number of images to process:", min_value=1, max_value=20, value=5)
 
-    pasted_text = ensure_strong_in_h3(pasted_text)
+        if st.button("Process"):
+            st.write("Processing...")
 
-    # Replace list with numbered h2
-    def replace_list_with_numbered_h2(html):
-        soup = BeautifulSoup(html, 'html.parser')
-        counter = 1
-        for list_tag in soup.find_all(['ul', 'ol']):
-            for li in list_tag.find_all('li', attrs={'aria-level': '1'}):
-                h2_tag = li.find('h2')
-                if h2_tag:
-                    strong_tag = h2_tag.find('strong')
-                    if strong_tag:
-                        new_string = soup.new_string(f"{counter}. ")
-                        strong_tag.insert(0, new_string)
-                    counter += 1
-                    li.replace_with(h2_tag)
-            list_tag.unwrap()
-        return str(soup)
+            # Perform HTML processing
+            titles = extract_h2_titles(html_content)
+            st.write("Extracted H2 Titles:")
+            st.write(titles)
+            
+            html_content = re.sub(r'<span style="font-weight: 400;">(.*?)<\/span>', r'\1', html_content, flags=re.DOTALL)
+            html_content = re.sub(r'<span style="font-weight: 400;"><\/span>', '', html_content)
+            html_content = replace_nbsp_with_br(html_content)
 
-    pasted_text = replace_list_with_numbered_h2(pasted_text)
+            base_domain = 'https://www.thecollector.com/'
+            html_content = add_target_blank_to_anchors(html_content, base_domain)
+            html_content = ensure_strong_in_h2(html_content)
+            html_content = ensure_strong_in_h3(html_content)
+            html_content = replace_list_with_numbered_h2(html_content)
+            html_content = replace_list_with_numbered_h3(html_content)
+            html_content = replace_br_with_nbsp(html_content)
 
-    # Replace list with numbered h3
-    def replace_list_with_numbered_h3(html):
-        soup = BeautifulSoup(html, 'html.parser')
-        counter = 1
-        list_items = soup.find_all('li', attrs={'aria-level': '1'})
-        for li in list_items:
-            h3_tag = li.find('h3')
-            if h3_tag:
-                for b_tag in h3_tag.find_all('b'):
-                    strong_tag = soup.new_tag('strong')
-                    strong_tag.extend(b_tag.contents)
-                    b_tag.replace_with(strong_tag)
-                strong_tag = h3_tag.find('strong')
-                if strong_tag:
-                    new_string = soup.new_string(f"{counter}. ")
-                    strong_tag.insert(0, new_string)
-                counter += 1
-                li.replace_with(h3_tag)
-        return str(soup)
+            st.write("Processed HTML content:")
+            st.code(html_content)
 
-    pasted_text = replace_list_with_numbered_h3(pasted_text)
+            # Selenium setup
+            service = Service(CHROME_DRIVER_PATH)
+            options = Options()
+            driver = webdriver.Chrome(service=service, options=options)
+            
+            try:
+                login_to_wordpress(driver, st.text_input("Enter your WordPress username:"), st.text_input("Enter your WordPress password:"))
+                navigate_to_media_library(driver)
+                select_images(driver, num_images_to_process)
+                attach_first_selected_image(driver)
+                search_and_select_article(driver, article_name)
+                image_htmls = process_images(driver, num_images_to_process)
 
-    # Replace <br> with &nbsp;
-    def replace_br_with_nbsp(html):
-        return re.sub(r'<br\s*/?>', '&nbsp;', html, flags=re.IGNORECASE)
+                result_text, _ = replace_text_with_html(html_content, image_htmls)
+                result_text = replace_br_with_nbsp(result_text)
 
-    final_html = replace_br_with_nbsp(pasted_text)
-    st.write("Processed HTML Content:")
-    st.text_area("Processed HTML", final_html, height=400)
-
-    # Display generated HTML in clipboard
-    pyperclip.copy(final_html)
-    st.success("Processed text copied to clipboard!")
-
-    # Handling image attachments (simplified, consider running in a separate script)
-    st.write("Image Attachment Functionality is under development. To be included in future versions.")
-
+                st.write("Final HTML with images:")
+                st.code(result_text)
+            finally:
+                driver.quit()
+                
+if __name__ == "__main__":
+    main()
